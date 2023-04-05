@@ -1,199 +1,109 @@
-package com.neutrino.service;
-
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import org.springframework.core.io.buffer.DataBufferUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.client.reactive.ClientHttpRequest;
+import org.springframework.http.client.reactive.ClientHttpResponse;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.lang.Nullable;
+import org.springframework.util.StringUtils;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.util.annotation.NonNull;
 
 import java.nio.charset.StandardCharsets;
-import java.time.LocalDateTime;
+import java.time.Duration;
+import java.time.Instant;
 
-public class LoggingExchangeFilterFunction extends ExchangeFilterFunction {
+public class CustomLoggingFilter implements ExchangeFunction {
 
-    public LoggingExchangeFilterFunction(Logger logger) {
-        this.logger = logger;
+    private static final Logger logger = LoggerFactory.getLogger(CustomLoggingFilter.class);
+
+    private final ExchangeFunction delegate;
+
+    public CustomLoggingFilter(ExchangeFunction delegate) {
+        this.delegate = delegate;
     }
-
 
     @Override
-    public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
-        Context context = Context.of(CLIENT_REQUEST_CONTEXT_KEY, request);
-
-        String requestBody = extractRequestBody(request, context);
-
-        logRequest(request, requestBody.getBytes());
-
-        long startTime = System.currentTimeMillis();
-        return next.exchange(request)
-                   .flatMap(response -> {
-                       long elapsedTime = System.currentTimeMillis() - startTime;
-
-                       byte[] responseBody = logResponse(response, startTime, elapsedTime);
-
-                       return Mono.just(response.bufferBody().map(buffer -> {
-                           DataBufferUtils.join(Flux.just(DataBuffer.wrap(responseBody)),
-                                                  buffer)
-                                          .map(dataBuffer -> {
-                                              byte[] bytes = new byte[dataBuffer.readableByteCount()];
-                                              dataBuffer.read(bytes);
-                                              DataBufferUtils.release(dataBuffer);
-                                              return bytes;
-                                          })
-                                          .subscribe(bodyBytes -> {
-                                              logResponse(response, bodyBytes, startTime, elapsedTime);
-                                          });
-                           return response;
-                       }));
-                   })
-                   .onErrorResume(throwable -> {
-                       long elapsedTime = System.currentTimeMillis() - startTime;
-
-                       logErrorResponse(throwable, requestBody.getBytes(), startTime);
-
-                       return Mono.error(throwable);
-                   });
+    public Mono<ClientHttpResponse> exchange(ClientHttpRequest request) {
+        logRequest(request);
+        Instant requestTime = Instant.now();
+        return delegate.exchange(request)
+                       .doOnNext(response -> logResponse(request.getMethod(), request.getURI()
+                                                                                     .toString(), request.getHeaders(), response,
+                               requestTime));
     }
 
-
-    private Mono<? extends Throwable> logErrorResponse(Throwable throwable, byte[] requestBody, long startTime) {
-        long elapsedTime = System.currentTimeMillis() - startTime;
-
-        HttpStatus httpStatus;
-        if (throwable instanceof WebClientException) {
-            httpStatus = ((WebClientException) throwable).getStatusCode();
-        } else {
-            httpStatus = HttpStatus.INTERNAL_SERVER_ERROR;
-        }
-
-        StringBuilder logMessage = new StringBuilder();
-
-        logMessage.append("[")
-                  .append(LocalDateTime.now().toString())
-                  .append("] ")
-                  .append("Request failed in ")
-                  .append(elapsedTime)
-                  .append(" ms, status code: ")
-                  .append(httpStatus.value())
-                  .append(", status text: ")
-                  .append(httpStatus.getReasonPhrase())
-                  .append(", message: ")
-                  .append(throwable.getMessage())
-                  .append(System.lineSeparator());
-
-        logError(logMessage.toString(), throwable, requestBody, startTime, elapsedTime);
-
-        return Mono.error(throwable);
-    }
-
-    private Mono<String> extractRequestBody(ClientRequest request) {
-        if (request.body() == null) {
-            return Mono.empty();
-        }
-
-        if (request.body() instanceof String) {
-            return Mono.just((String) request.body());
-        }
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.addAll(request.headers());
-
-        Flux<DataBuffer> dataBuffers = request.body(BodyExtractors.toDataBuffers());
-        return DataBufferUtils.join(dataBuffers)
-                              .map(dataBuffer -> {
-                                  byte[] bytes = new byte[dataBuffer.readableByteCount()];
-                                  dataBuffer.read(bytes);
-                                  DataBufferUtils.release(dataBuffer);
-                                  return bytes;
-                              })
-                              .map(bytes -> new String(bytes, headers.getContentTypeCharset()))
-                              .onErrorResume(error -> {
-                                  logger.error("Error extracting request body: {}", error.getMessage());
-                                  return Mono.empty();
-                              });
-    }
-
-    private void logRequest(ClientRequest request, byte[] requestBody) {
+    private void logRequest(ClientHttpRequest request) {
+        HttpMethod method = request.getMethod();
+        String url = request.getURI()
+                            .toString();
+        HttpHeaders headers = request.getHeaders();
+        Object requestBody = null;
         if (logger.isDebugEnabled()) {
-            logger.debug("Sending request to {}: {}", request.url(), request.method());
-            request.headers().forEach((name, values) -> values.forEach(value -> logger.debug("{}={}", name, value)));
-            if (requestBody != null) {
-                logger.debug("Request body: {}", new String(requestBody, StandardCharsets.UTF_8));
+            requestBody = request.getBody();
+        }
+        logger.debug("[Request] Method: {}, URL: {}, Headers: {}, Body: {}", method, url, headers, requestBody);
+    }
+
+    private void logResponse(HttpMethod method, String url, HttpHeaders requestHeaders, @Nullable ClientHttpResponse response, Instant requestTime) {
+        Instant responseTime = Instant.now();
+        long durationMs = Duration.between(requestTime, responseTime)
+                                  .toMillis();
+
+        if (response != null) {
+            HttpStatus status = response.getStatusCode();
+            HttpHeaders headers = response.getHeaders();
+            Object responseBody = null;
+            if (logger.isDebugEnabled()) {
+                responseBody = readResponseBody(response);
             }
+            logger.debug("[Response] Method: {}, URL: {}, Status: {}, Headers: {}, Duration: {} ms, ResponseBody: {}", method,
+                    url, status, headers, durationMs, responseBody);
+        } else {
+            logger.debug("[Response] Method: {}, URL: {}, Status: [NO RESPONSE], Headers: {}, Duration: {} ms", method, url,
+                    requestHeaders, durationMs);
         }
     }
 
-    private byte[] logResponse(ClientResponse response, long startTime, long elapsedTime) {
-        HttpStatus statusCode = response.statusCode();
-
-        StringBuilder logMessage = new StringBuilder();
-
-        logMessage.append("[")
-                  .append(LocalDateTime.now().toString())
-                  .append("] ")
-                  .append("Response received in ")
-                  .append(elapsedTime)
-                  .append(" ms, status code: ")
-                  .append(statusCode.value())
-                  .append(", status text: ")
-                  .append(statusCode.getReasonPhrase())
-                  .append(System.lineSeparator());
-
-        HttpHeaders headers = response.headers();
-        if (!headers.isEmpty()) {
-            logMessage.append("Headers: ")
-                      .append(headers)
-                      .append(System.lineSeparator());
-        }
-
-        byte[] responseBody = response.bodyToMono(DataBuffer.class)
-                                      .flatMap(dataBuffer -> {
-                                          byte[] bytes = new byte[dataBuffer.readableByteCount()];
-                                          dataBuffer.read(bytes);
-                                          DataBufferUtils.release(dataBuffer);
-                                          return Mono.just(bytes);
-                                      })
-                                      .block();
-
-        logMessage.append("Response body: ")
-                  .append(new String(responseBody))
-                  .append(System.lineSeparator());
-
-        logDebug(logMessage.toString());
-
-        return responseBody;
+    private Object readResponseBody(ClientHttpResponse response) {
+        Flux<DataBuffer> flux = response.getBody();
+        StringBuilder builder = new StringBuilder();
+        flux.subscribe(buffer -> {
+            byte[] bytes = new byte[buffer.readableByteCount()];
+            buffer.read(bytes);
+            builder.append(new String(bytes, StandardCharsets.UTF_8));
+        });
+        return builder.toString();
     }
 
-
-    private void logError(ClientResponse response, String responseBody, Throwable throwable) {
-        if (logger.isErrorEnabled()) {
-            logger.error("Error while calling {}: {}", response.request().url(), throwable.getMessage());
-            response.headers().asHttpHeaders().forEach((name, values) -> values.forEach(value -> logger.error("{}={}", name, value)));
-            logger.error("Response body: {}", responseBody, throwable);
-        }
+    @Override
+    public Mono<ClientHttpResponse> exchange(ServerWebExchange exchange) {
+        ServerHttpRequest request = exchange.getRequest();
+        logRequest(request);
+        Instant requestTime = Instant.now();
+        return delegate.exchange(exchange)
+                       .doOnNext(response -> logResponse(request.getMethod(), request.getURI()
+                                                                                     .toString(), request.getHeaders(), response,
+                               requestTime));
     }
 
-    private void logInfo(ClientResponse response, String responseBody) {
-        if (logger.isInfoEnabled()) {
-            logger.info("Received response from {}: {}", response.request().url(), response.statusCode());
-            response.headers().asHttpHeaders().forEach((name, values) -> values.forEach(value -> logger.info("{}={}", name, value)));
-            logger.info("Response body: {}", responseBody);
-        }
-    }
-
-    private void logDebug(ClientResponse response, String responseBody) {
+    private void logRequest(ServerHttpRequest request) {
+        HttpMethod method = request.getMethod();
+        String url = request.getURI()
+                            .toString();
+        HttpHeaders headers = request.getHeaders();
+        Object requestBody = null;
         if (logger.isDebugEnabled()) {
-            logger.debug("Received response from {}: {}", response.request().url(), response.statusCode());
-            response.headers().asHttpHeaders().forEach((name, values) -> values.forEach(value -> logger.debug("{}={}", name, value)));
-            logger.debug("Response body: {}", responseBody);
+            requestBody = request.getBody();
         }
+        logger.debug("[Request] Method: {}, URL: {}, Headers: {}, Body: {}", method, url, headers, requestBody);
     }
-
-    private void logWarn(ClientResponse response) {
-        if (logger.isWarnEnabled()) {
-            logger.warn("Received unexpected response from {}: {}", response.request().url(), response.statusCode());
-            response.headers().asHttpHeaders().forEach((name, values) -> values.forEach(value -> logger.warn("{}={}", name, value)));
-        }
-    }
-
 
 }
